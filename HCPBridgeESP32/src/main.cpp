@@ -14,7 +14,10 @@ extern "C" {
 #include "preferences_handler.h"
 #include "sensor_manager.h"
 #include "mqtt_handler.h"
+#include "ble_handler.h"
 #include "../WebUI/index_html.h"
+
+BleHandler bleHandler;
 
 // ============================================================================
 // Global objects
@@ -339,6 +342,9 @@ void setup() {
     // MQTT onConnect sends discovery, needs sensor status already set
     sensorManager.begin(localPrefs);
 
+    // BLE server
+    bleHandler.begin(localPrefs);
+
     // Setup MQTT
     mqttHandler.begin(localPrefs, &prefHandler, &sensorManager);
 
@@ -473,11 +479,85 @@ void setup() {
 
     server.onRequestBody([](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (!requireAuth(request)) return;
+
+        // /config
         if (request->url() == "/config") {
             JsonDocument doc;
             deserializeJson(doc, data);
             prefHandler.saveConf(doc);
             request->send(200, "text/plain", "OK");
+            return;
+        }
+
+        // /bleuser
+        if (request->url() == "/bleuser" && index + len >= total) {
+            AsyncResponseStream *response = request->beginResponseStream("application/json");
+            JsonDocument result;
+            result["ok"] = false;
+
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc, data, len);
+            if (err) {
+                result["error"] = "invalid json";
+                serializeJson(result, *response);
+                request->send(response);
+                return;
+            }
+
+            String action = doc["action"].as<String>();
+            char userId = doc["userId"].as<String>()[0];
+
+            if (action == "setPin") {
+                String pin = doc["pin"].as<String>();
+                if (pin.length() >= 4) {
+                    bleHandler.setUserPin(userId, pin.c_str());
+                    result["ok"] = true;
+                } else {
+                    result["error"] = "pin too short (min 4 chars)";
+                }
+            } else if (action == "add") {
+                String pin = doc["pin"].as<String>();
+                if (pin.length() >= 4) {
+                    bleHandler.addUser(userId, pin.c_str());
+                    result["ok"] = true;
+                } else {
+                    result["error"] = "pin too short (min 4 chars)";
+                }
+            } else if (action == "remove") {
+                bleHandler.removeUser(userId);
+                result["ok"] = true;
+            } else if (action == "toggle") {
+                bool current = bleHandler.getUserEnabled(userId);
+                bleHandler.setUserEnabled(userId, !current);
+                result["ok"] = true;
+                result["enabled"] = !current;
+            } else if (action == "enable") {
+                bleHandler.setUserEnabled(userId, true);
+                result["ok"] = true;
+            } else if (action == "disable") {
+                bleHandler.setUserEnabled(userId, false);
+                result["ok"] = true;
+            } else if (action == "resetPin") {
+                String defaultPin = String(userId) + "00" + String(userId - 'A' + 1) + "BLE";
+                bleHandler.setUserPin(userId, defaultPin.c_str());
+                result["ok"] = true;
+                result["defaultPin"] = defaultPin;
+            }
+
+            serializeJson(result, *response);
+            request->send(response);
+            return;
+        }
+
+        // /blelog
+        if (request->url() == "/blelog" && index + len >= total) {
+            AsyncResponseStream *response = request->beginResponseStream("application/json");
+            JsonDocument result;
+            bleHandler.clearAuditLog();
+            result["ok"] = true;
+            serializeJson(result, *response);
+            request->send(response);
+            return;
         }
     });
 
@@ -491,6 +571,57 @@ void setup() {
         request->send(response);
         prefHandler.resetPreferences();
     });
+
+    // ========================================================================
+    // BLE User Management
+    // ========================================================================
+
+    // GET /bleusers — list all 8 users
+    server.on("/bleusers", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!requireAuth(request)) return;
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument root;
+        JsonArray users = root["users"].to<JsonArray>();
+        for (char c = 'A'; c <= 'H'; c++) {
+            JsonObject user = users.createNestedObject();
+            user["id"] = String(c);
+            user["enabled"] = bleHandler.getUserEnabled(c);
+            JsonObject info;
+            if (bleHandler.getUserInfo(c, info)) {
+                user["exists"] = true;
+            } else {
+                user["exists"] = false;
+            }
+        }
+        root["locked_out"] = bleHandler.isLockedOut();
+        if (bleHandler.isLockedOut()) {
+            root["lockout_remaining_s"] = bleHandler.getLockoutRemainingMs() / 1000;
+        }
+        serializeJson(root, *response);
+        request->send(response);
+    });
+
+    // POST /bleuser — managed via onRequestBody
+    // Body: {"action":"setPin","userId":"A","pin":"newpin"}
+    //       {"action":"toggle","userId":"B"}
+    //       {"action":"enable","userId":"C"}
+    //       {"action":"disable","userId":"D"}
+    //       {"action":"resetPin","userId":"E"}  (resets to default temp PIN)
+    //       {"action":"add","userId":"I","pin":"somepin"}
+    //       {"action":"remove","userId":"I"}
+
+    // GET /blelog — get audit log
+    server.on("/blelog", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!requireAuth(request)) return;
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument root;
+        JsonArray log = root["log"].to<JsonArray>();
+        bleHandler.getAuditLog(log);
+        serializeJson(root, *response);
+        request->send(response);
+    });
+
+    // POST /blelog — clear audit log (managed via onRequestBody)
 
     ElegantOTA.begin(&server);
     ElegantOTA.setAutoReboot(true);
@@ -509,6 +640,7 @@ void setup() {
 
 void loop() {
     ElegantOTA.loop();
+    bleHandler.loop();
 
     if (sensorDisableTriggered) {
         sensorDisableTriggered = false;

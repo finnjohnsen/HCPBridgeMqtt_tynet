@@ -51,6 +51,7 @@ If you don't use Home Assistant you can modify the yaml configuration to use MQT
 - Efficient MQTT traffic (only publish on state change)  
 - Support multiple HCP Bridges for multiple garage doors (one bridge per motor)
 - Support for ESP32-S3
+- BLE (Bluetooth Low Energy) door control with per-user PIN authentication  
 
 <br>
 
@@ -71,6 +72,81 @@ If the same SSID is broadcast by several access points (UniFi, mesh, repeaters),
 Turn it off to get the slightly faster (but signal-agnostic) fast scan on single-AP networks.
 
 For the ESPHome based firmware the equivalent is `fast_connect: false` in the `wifi:` block (the default).
+
+<br>
+
+## BLE (Bluetooth Low Energy) Door Control
+
+The firmware includes a BLE server that allows you to control your garage door from a phone or computer using Bluetooth Low Energy. BLE control requires PIN authentication and includes security features like lockout after failed attempts.
+
+### Connecting
+
+The device advertises on BLE using the same name as the **hostname** set in Basic Configuration (default: **HCPBRIDGE**). You can connect using:
+- Any BLE scanner app (nRF Connect, LightBlue, etc.)
+- A Web Bluetooth API page (Chrome/Edge)
+- A custom mobile app
+
+### Authentication
+
+Before sending commands, authenticate by writing JSON to the **AUTH** characteristic:
+
+```json
+{"user": "A", "pin": "your-pin"}
+```
+
+After authentication, the **STATUS** characteristic includes `"auth": true` in notifications.
+
+### Characteristics
+
+| Characteristic | UUID Suffix | Property | Usage |
+|---------------|-------------|----------|-------|
+| OPEN | `...5c70` | WRITE | Write any byte to open the door |
+| CLOSE | `...5c71` | WRITE | Write any byte to close the door |
+| STOP | `...5c72` | WRITE | Write any byte to stop the door |
+| TOGGLE | `...5c73` | WRITE | Write any byte to toggle the door |
+| STATUS | `...5c74` | NOTIFY | Pushes door state as JSON with auth status |
+| AUTH | `...5c75` | WRITE | Write `{"user":"A","pin":"..."}` to authenticate |
+
+**Service UUID:** `fb0a5c8e-9d21-4b6a-8c3f-1e7a0d4b5c6f`
+
+### Security Features
+
+- **Per-user PINs** — 8 users (A–H), each with a unique PIN
+- **SHA-256 + salt** — PINs stored as salted hashes, never in plain text
+- **Lockout** — 5 failed attempts triggers a 30-minute lockout
+- **Per-connection auth** — each new connection requires fresh authentication
+- **Audit log** — 100 entries of who did what, stored on device
+
+### Managing Users via Web UI
+
+Connect to the device's WiFi (HCPBRIDGE) and visit `http://192.168.4.1`, then use the API endpoints:
+
+**List users:**
+```
+GET /bleusers
+```
+
+**Change a PIN:**
+```
+POST /bleuser
+{"action": "setPin", "userId": "A", "pin": "newpin123"}
+```
+
+**Enable/disable a user:**
+```
+POST /bleuser
+{"action": "toggle", "userId": "B"}
+```
+
+**View audit log:**
+```
+GET /blelog
+```
+
+**Clear audit log:**
+```
+POST /blelog
+```
 
 <br><br><br><br><br><br><br><br><br><br>
 
@@ -133,8 +209,33 @@ For the ESPHome based firmware the equivalent is `fast_connect: false` in the `w
  <summary>Step 2: Firmware upload</summary>
  
  ## Upload the firmware
- To use the board without any additional sensors (f.e. as showed in section [wiring](#wiring)) you only need to upload the standard firmware binary.
- 
+
+### Option A: Flash via CLI (recommended)
+
+Requires [`esptool`](https://github.com/espressif/esptool) installed (`pip3 install esptool`). Connect the ESP32-S3 via USB and run:
+
+```bash
+esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 write_flash 0x0 HCP_Tynet_merged.bin
+```
+
+- Replace `/dev/ttyACM0` with your serial port (`/dev/ttyUSB0`, `COM3`, etc.)
+- The merged binary is produced by PlatformIO at `HCPBridgeESP32/.pio/build/HCP_Tynet/HCP_Tynet_merged.bin` or in `HCPBridgeESP32/fw/HCP_Tynet_merged.bin`
+- On first boot the device creates a WiFi hotspot (**HCPBRIDGE**) for initial configuration
+
+### Option B: Build and flash with PlatformIO
+
+```bash
+cd HCPBridgeESP32
+pio run -e HCP_Tynet          # build
+pio run -e HCP_Tynet -t upload # build + flash
+```
+
+Set the upload port in `platformio.ini` if not `/dev/ttyACM0`:
+```ini
+[env:HCP_Tynet]
+upload_port = /dev/ttyUSB0
+```
+
 ### Sensors
  
  To use additional sensors, you have also to build and upload the according firmware for the sensor. See [flash instructions](docs/flashing_instructions.md) for further info.
@@ -199,8 +300,7 @@ For the ESPHome based firmware the equivalent is `fast_connect: false` in the `w
   The preferences will stay even after an OTA update.
   When the memory of your ESP gets deleted your ESP will again load the settings from the configuration.h file.
   
-  You can reset all preferences by pressing the BOOT button on the ESP for longer then 5 Seconds and releasing it.
-  This will reset all preferences to the default values from configuration.h in the flashed firmware build.
+  **Reset methods** (see section [Reset and Wipe Data](#reset-and-wipe-data) below)
 </details><br>
 
 <details>
@@ -220,6 +320,66 @@ For the ESPHome based firmware the equivalent is `fast_connect: false` in the `w
   
   ![alt text](docs/Images/antrieb-min.png)
 </details><br>
+
+## Reset and Wipe Data
+
+There are multiple ways to reset the device to factory defaults or wipe specific data without reflashing.
+
+### Method 1: BOOT Button (5 quick presses)
+
+Press the **BOOT** button on the ESP32 **5 times** within a **6-second window**. This triggers a full preference reset and the device reboots.
+
+- All WiFi credentials, MQTT settings, and sensor configuration are erased
+- BLE user data (PINs, audit log) is **preserved** (stored in a separate NVS namespace)
+- Device loads default settings from the firmware's `configuration.h`
+
+### Method 2: HTTP Endpoint
+
+If you can reach the device on your network:
+
+```
+GET http://[deviceip]/reset
+```
+
+This clears the main preferences (WiFi, MQTT, sensors) and reboots. Same effect as the BOOT button method above. BLE user data is preserved.
+
+### Method 3: Wipe All Data (Full Factory Reset)
+
+To wipe **everything** (including BLE users, audit log, and bonded devices):
+
+```bash
+esptool --chip esp32s3 --port /dev/ttyACM0 erase_flash
+```
+
+Then reflash the firmware:
+
+```bash
+esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 write_flash 0x0 HCP_Tynet_merged.bin
+```
+
+Replace `/dev/ttyACM0` with your device's serial port (e.g., `/dev/ttyUSB0` on Linux, `COM3` on Windows).
+
+### Disable Sensors Only (3 quick presses)
+
+Press the **BOOT** button **3 times** within a **6-second window**. This disables all external sensors and reboots — useful if a sensor is causing crashes. WiFi/MQTT/BLE settings remain intact.
+
+### Reset BLE Lockout
+
+If the BLE service is locked out (5 failed attempts):
+
+- Wait 30 minutes for the lockout to expire automatically
+- Or use the Web UI to change a user's PIN, which resets the lockout counter
+- Or use `GET http://[deviceip]/bleusers` to check remaining lockout time
+
+### What Gets Reset
+
+| Action | WiFi/MQTT | BLE Users | BLE Audit Log | Sensors |
+|--------|-----------|-----------|---------------|---------|
+| 5x BOOT press | Reset | Kept | Kept | Reset |
+| 3x BOOT press | Kept | Kept | Kept | Disabled |
+| HTTP `/reset` | Reset | Kept | Kept | Reset |
+| `erase_flash` | Reset | Reset | Reset | Reset |
+| POST `/blelog` | Kept | Kept | Cleared | Kept |
 
 ## Set the ventilation position 
 
